@@ -5,7 +5,7 @@
 <strong>reverseshell.rs</strong>
 </h1>
 
-## Description
+[![Rust](https://github.com/mranv/reverseshell.rs/actions/workflows/rust.yml/badge.svg)](https://github.com/mranv/reverseshell.rs/actions/workflows/rust.yml)
 
 reverseshell.rs is a TLS over TCP reverse shell developped in Rust with client and server embedded in the same binary. This project has been mainly started to learn Rust with a tool that could help me in my work, and the code quality could be greatly improved. This project is like my Rust sandbox where I can test new things.
 
