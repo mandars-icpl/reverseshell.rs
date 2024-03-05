@@ -51,7 +51,11 @@ openssl pkcs12 -export -out certificate.pfx -inkey private.key -in certificate.c
 
 The project can be compiled with `cargo build --release` on Windows or Linux and the binary will be present in `target/release/`, or the target name if a target is specified.
 
-Tu compile for a different target than your current OS you can use, for example, `cargo build --release --target x86_64-unknown-linux-gnu` (be sure to use the appropriate toolchain and to have all the required dependencies).
+To cross-compile for a different target than your current OS you can use, for example, `cargo build --release --target x86_64-pc-windows-gnu`. In order to work, this requires the appropriate target toolchain to be installed. As an example, to generate Windows binaries from an Ubuntu machine:
+
+- `sudo apt install mingw-w64`
+- `rustup target add x86_64-pc-windows-gnu`
+- `cargo build --release --target x86_64-pc-windows-gnu`
 
 The project compilation has been tested with the following Rust toolchains :
 
@@ -160,3 +164,4 @@ Usage of anything presented in this repo to attack targets without prior mutual 
 - [RustPacker](https://github.com/Nariod/RustPacker) by [Nariod](https://github.com/Nariod)
 - Nik Brendler's blog posts about pipe communication between process in Rust. [Part 1](https://www.nikbrendler.com/rust-process-communication/) and [Part 2](https://www.nikbrendler.com/rust-process-communication-part-2/)
 - [rust-mordor-rs](https://github.com/gmh5225/rust-mordor-rs) by [memN0ps](https://twitter.com/memN0ps), an incredible library for indirect syscalls in Rust
+- [rs-shell](https://github.com/BlWasp/rs-shell) by [BlWasp](https://github.com/BlWasp), an incredible tool for reverse shell in Rust
